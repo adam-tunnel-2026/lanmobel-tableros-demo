@@ -1,0 +1,142 @@
+name: Lan Mobel - APK desde ZIP
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '*.zip*'
+      - '.github/workflows/*.zip*'
+      - '.github/workflows/lanmobel-zip.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lanmobel-demo
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Obtener archivos subidos
+        uses: actions/checkout@v4
+
+      - name: Descomprimir el proyecto automaticamente
+        run: |
+          python3 - <<'PY'
+          import base64
+          import io
+          import re
+          import stat
+          import zipfile
+          from pathlib import Path
+
+          MAX_SIZE = 20000000
+
+          def inspect_archive(archive):
+              entries = archive.infolist()
+              if len(entries) > 500 or sum(i.file_size for i in entries) > MAX_SIZE:
+                  raise ValueError('Archivo demasiado grande')
+              for item in entries:
+                  path = Path(item.filename)
+                  if path.is_absolute() or '..' in path.parts or stat.S_ISLNK(item.external_attr >> 16):
+                      raise ValueError('Ruta no valida')
+              if archive.testzip() is not None:
+                  raise ValueError('ZIP danado')
+
+          def project_version(source):
+              with zipfile.ZipFile(io.BytesIO(source)) as archive:
+                  inspect_archive(archive)
+                  config = 'lanmobel-demo/app/build.gradle'
+                  if config not in archive.namelist():
+                      return None
+                  text = archive.read(config).decode('utf-8')
+                  code = re.search(r'versionCode\s+(\d+)', text)
+                  version = re.search(r"versionName\s+['\"]([^'\"]+)['\"]", text)
+                  if code and version:
+                      return int(code.group(1)), version.group(1)
+              return None
+
+          files = []
+          for directory in [Path('.'), Path('.github/workflows')]:
+              if directory.is_dir():
+                  files.extend(p for p in directory.iterdir() if p.is_file() and re.search(r'\.zip(?:\s*\(\d+\))?$', p.name, re.I) and p.name.lower().startswith('lanmobel'))
+
+          projects = []
+          for file in sorted(files):
+              try:
+                  original = file.read_bytes()
+                  with zipfile.ZipFile(io.BytesIO(original)) as outer:
+                      inspect_archive(outer)
+                      candidates = [(str(file), original)]
+                      for name in outer.namelist():
+                          if re.search(r'\.ya?ml(?:\s*\(\d+\))?$', name, re.I):
+                              document = outer.read(name).decode('utf-8-sig')
+                              match = re.search(r"payload\s*=\s*'''(.*?)'''", document, re.S)
+                              if match:
+                                  candidates.append((str(file) + ' / ' + name, base64.b64decode(match.group(1))))
+                      for label, source in candidates:
+                          version = project_version(source)
+                          if version:
+                              print('Encontrado:', label, 'version', version[1], 'codigo', version[0])
+                              if version[0] >= 3:
+                                  projects.append((version[0], label, version[1], source))
+              except (ValueError, UnicodeError, zipfile.BadZipFile, KeyError) as error:
+                  print('No se puede usar', file, ':', error)
+
+          if not projects:
+              raise SystemExit('No hay un proyecto de recepcion 0.3.0 o posterior. Sube el ZIP actualizado sin descomprimir a la raiz del repositorio.')
+
+          code, label, version, source = max(projects, key=lambda item: (item[0], item[1]))
+          with zipfile.ZipFile(io.BytesIO(source)) as archive:
+              inspect_archive(archive)
+              archive.extractall('demo-build')
+          print('SELECCIONADO:', label, 'version', version, 'codigo', code)
+          PY
+
+      - name: Probar recepcion y almacen
+        run: |
+          node demo-build/lanmobel-demo/tests/stock.test.cjs
+          node demo-build/lanmobel-demo/tests/ui.test.cjs
+
+      - name: Preparar Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Preparar Android
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
+
+      - name: Preparar Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Reutilizar firma de prueba
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: lanmobel-demo-debug-signing-v1
+
+      - name: Compilar APK
+        working-directory: demo-build/lanmobel-demo
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Preparar y verificar APK
+        run: |
+          mkdir -p descarga
+          cp demo-build/lanmobel-demo/app/build/outputs/apk/debug/app-debug.apk descarga/LanMobel-Tableros-Demo.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose descarga/LanMobel-Tableros-Demo.apk
+
+      - name: Guardar APK descargable
+        uses: actions/upload-artifact@v4
+        with:
+          name: LanMobel-Demo-Android
+          path: descarga/LanMobel-Tableros-Demo.apk
+          retention-days: 3
+          if-no-files-found: error
