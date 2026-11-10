@@ -1,0 +1,129 @@
+name: Lan Mobel - Demo Android
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/lanmobel-demo.yml'
+      - '.github/workflows/LanMobel-YML.zip'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lanmobel-demo
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Descargar archivos del repositorio
+        uses: actions/checkout@v4
+
+      - name: Preparar Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Preparar Android
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
+
+      - name: Preparar Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Recuperar el proyecto del ZIP
+        run: |
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import io
+          import re
+          import zipfile
+          from pathlib import Path
+
+          package = Path(".github/workflows/LanMobel-YML.zip")
+
+          if not package.is_file():
+              raise SystemExit(
+                  "Falta LanMobel-YML.zip dentro de .github/workflows"
+              )
+
+          with zipfile.ZipFile(package) as outer:
+              if "lanmobel-demo.yml" not in outer.namelist():
+                  raise SystemExit(
+                      "El ZIP debe contener lanmobel-demo.yml"
+                  )
+              document = outer.read(
+                  "lanmobel-demo.yml"
+              ).decode("utf-8-sig")
+
+          match = re.search(
+              r"payload\s*=\s*'''(.*?)'''",
+              document,
+              re.S
+          )
+
+          if not match:
+              raise SystemExit(
+                  "No se encuentra el proyecto dentro del ZIP"
+              )
+
+          source = base64.b64decode(match.group(1))
+
+          expected = (
+              "af76be5751c367d58e7321e5a647d34a6"
+              "bb1dfb07fd0e3d9b81dc18f1987979a"
+          )
+
+          if hashlib.sha256(source).hexdigest() != expected:
+              raise SystemExit(
+                  "El ZIP no corresponde a la demo preparada"
+              )
+
+          with zipfile.ZipFile(io.BytesIO(source)) as archive:
+              if archive.testzip() is not None:
+                  raise SystemExit("El proyecto está dañado")
+
+              for name in archive.namelist():
+                  path = Path(name)
+                  if path.is_absolute() or ".." in path.parts:
+                      raise SystemExit("Ruta de archivo no válida")
+
+              archive.extractall("demo-build")
+
+          print("Proyecto recuperado y comprobado")
+          PY
+
+      - name: Comprobar inventario y cortes
+        run: |
+          node demo-build/lanmobel-demo/tests/stock.test.cjs
+          node demo-build/lanmobel-demo/tests/ui.test.cjs
+
+      - name: Compilar APK
+        working-directory: demo-build/lanmobel-demo
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Preparar descarga
+        run: |
+          mkdir -p descarga
+          cp demo-build/lanmobel-demo/app/build/outputs/apk/debug/app-debug.apk descarga/LanMobel-Tableros-Demo.apk
+
+      - name: Verificar firma de la APK
+        run: |
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose descarga/LanMobel-Tableros-Demo.apk
+
+      - name: Guardar APK descargable
+        uses: actions/upload-artifact@v4
+        with:
+          name: LanMobel-Demo-Android
+          path: descarga/LanMobel-Tableros-Demo.apk
+          retention-days: 3
+          if-no-files-found: error
