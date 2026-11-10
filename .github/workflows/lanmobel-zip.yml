@@ -1,0 +1,101 @@
+name: Lan Mobel - APK desde ZIP
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'LanMobel-Tableros-Demo.zip'
+      - '.github/workflows/lanmobel-zip.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lanmobel-demo
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Obtener archivos subidos
+        uses: actions/checkout@v4
+
+      - name: Descomprimir el proyecto automaticamente
+        run: |
+          python3 - <<'PY'
+          import re
+          import stat
+          import zipfile
+          from pathlib import Path
+
+          package = Path('LanMobel-Tableros-Demo.zip')
+          if not package.is_file():
+              raise SystemExit('Sube LanMobel-Tableros-Demo.zip a la raiz del repositorio, sin descomprimir.')
+
+          with zipfile.ZipFile(package) as archive:
+              if sum(i.file_size for i in archive.infolist()) > 20000000:
+                  raise SystemExit('El proyecto supera el tamano permitido para esta demo.')
+              for item in archive.infolist():
+                  path = Path(item.filename)
+                  if path.is_absolute() or '..' in path.parts or stat.S_ISLNK(item.external_attr >> 16):
+                      raise SystemExit('Ruta no valida dentro del ZIP.')
+              if archive.testzip() is not None:
+                  raise SystemExit('El ZIP esta incompleto o danado.')
+              archive.extractall('demo-build')
+
+          project = Path('demo-build/lanmobel-demo')
+          config = project / 'app/build.gradle'
+          if not config.is_file():
+              raise SystemExit('No se encuentra el proyecto Android dentro del ZIP.')
+          version = re.search(r'versionCode\s+(\d+)', config.read_text())
+          if not version or int(version.group(1)) < 3:
+              raise SystemExit('Este ZIP es antiguo. Sube el proyecto de recepcion 0.3.0 o posterior.')
+          print('Proyecto extraido y comprobado. Se compilara la version incluida en el ZIP.')
+          PY
+
+      - name: Probar recepcion y almacen
+        run: |
+          node demo-build/lanmobel-demo/tests/stock.test.cjs
+          node demo-build/lanmobel-demo/tests/ui.test.cjs
+
+      - name: Preparar Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Preparar Android
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
+
+      - name: Preparar Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Reutilizar firma de prueba
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: lanmobel-demo-debug-signing-v1
+
+      - name: Compilar APK
+        working-directory: demo-build/lanmobel-demo
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Preparar y verificar APK
+        run: |
+          mkdir -p descarga
+          cp demo-build/lanmobel-demo/app/build/outputs/apk/debug/app-debug.apk descarga/LanMobel-Tableros-Demo.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose descarga/LanMobel-Tableros-Demo.apk
+
+      - name: Guardar APK descargable
+        uses: actions/upload-artifact@v4
+        with:
+          name: LanMobel-Demo-Android
+          path: descarga/LanMobel-Tableros-Demo.apk
+          retention-days: 3
+          if-no-files-found: error
